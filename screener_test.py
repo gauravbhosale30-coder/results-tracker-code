@@ -1,7 +1,7 @@
 import requests
 from bs4 import BeautifulSoup
 
-url = "https://www.screener.in/company/TATAMOTORS/consolidated/"
+url = "https://www.screener.in/company/RELIANCE/consolidated/"
 r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
 print("Status:", r.status_code)
 
