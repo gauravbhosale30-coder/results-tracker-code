@@ -1,0 +1,33 @@
+name: List transcripts
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "How many companies (0 = all)"
+        default: "20"
+jobs:
+  list:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: gauravbhosale30-coder/results-tracker-data
+          token: ${{ secrets.DATA_REPO_TOKEN }}
+          path: data
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install requests beautifulsoup4
+      - run: python list_transcripts.py
+        env:
+          LIMIT: ${{ inputs.limit }}
+      - name: Save manifest to the private data repo
+        run: |
+          cd data
+          git config user.name "tracker-bot"
+          git config user.email "tracker-bot@users.noreply.github.com"
+          git add manifest.csv
+          git commit -m "Update transcript manifest" || echo "No changes"
+          git push
