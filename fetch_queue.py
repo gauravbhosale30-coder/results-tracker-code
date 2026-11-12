@@ -14,7 +14,7 @@ import requests
 LIST = "data/value_chain_leaders.csv"
 MANIFEST = "data/manifest.csv"
 OUT = "data/queue/Q1FY27"
-WINDOW = ("2026-07", "2026-09")      # Q1 FY27 calls
+WINDOW = ("2026-07", "2026-09")      # Q1 FY27 calls (Jul-Aug preferred, Sep only if checked)
 MIN_CHARS = 3000                     # less = scanned image PDF or broken file
 LIMIT = int(os.environ.get("LIMIT") or 0)
 
@@ -45,12 +45,26 @@ def pdf_text(url):
     return None
 
 
-# latest Q1 call per company
+Q1_RE = re.compile(r"Q1\s*-?\s*FY\s*'?(20)?27|first quarter|quarter ended (on )?(30(th)? )?june|"
+                   r"june 30,? 2026|30(th)? june,? 2026|Q1 (of )?(FY ?)?2026-27", re.I)
+
+
+def is_q1_call(text):
+    return bool(Q1_RE.search(text[:20000]))
+
+
+# Q1 call per company: latest Jul-Aug call; a September call only if there is none
+# (September files are often investor meets or one-off calls, so they are checked below)
 calls = {}
 for row in csv.DictReader(open(MANIFEST, encoding="utf-8")):
-    if WINDOW[0] <= row["period"] <= WINDOW[1] and row["url"]:
-        if row["code"] not in calls or row["period"] > calls[row["code"]]["period"]:
-            calls[row["code"]] = row
+    if not (WINDOW[0] <= row["period"] <= WINDOW[1] and row["url"]):
+        continue
+    cur = calls.get(row["code"])
+    main = row["period"] <= "2026-08"
+    if cur is None:
+        calls[row["code"]] = row
+    elif main and (cur["period"] > "2026-08" or row["period"] > cur["period"]):
+        calls[row["code"]] = row
 
 companies = [r for r in csv.DictReader(open(LIST, encoding="utf-8"))
              if r["Read wave"] in ("Wave 1", "Wave 2")]
@@ -65,14 +79,21 @@ for n, c in enumerate(companies, 1):
     call = calls.get(code)
     if call is None:
         status = "no_q1_call"
-    elif os.path.exists(path):
+    elif os.path.exists(path) and f"Source: {call['url']}" in open(path, encoding="utf-8").read(3000):
         status = "already_done"
+        if call["period"] > "2026-08" and not is_q1_call(open(path, encoding="utf-8").read()):
+            os.remove(path)
+            status = "not_q1_call"
     else:
+        if os.path.exists(path):          # an older pick for this company: replace it
+            os.remove(path)
         text = pdf_text(call["url"])
         if text is None:
             status = "download_failed"
         elif len(text) < MIN_CHARS:
             status = "no_text"
+        elif call["period"] > "2026-08" and not is_q1_call(text):
+            status = "not_q1_call"
         else:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(f"Company: {c['Company']}\nCode: {code}\n"
