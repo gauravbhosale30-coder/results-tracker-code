@@ -8,20 +8,19 @@ Reads  data/value_chain_leaders.csv  (companies to read)
        data/records/Q1FY27/          (Q1 records: baseline put on top of each Q2 file)
        data/q2_checklist.csv         (report Section 7 promises to test in Q2)
        data/extra_sources.csv        (hand-found transcript links, e.g. company websites)
-       data/universe.csv             (BSE codes for the BSE-filings backup)
 Writes data/queue/<QUARTER>/<CODE>.txt  one text file per company
        data/queue/<QUARTER>/_log.csv    status per company
-       data/queue/<QUARTER>/_missing.csv  companies still without a transcript, with BSE evidence
+       data/queue/<QUARTER>/_missing.csv  companies still without a transcript
+       data/queue/<QUARTER>/_rejected/    calls that failed the quarter check, kept for review
 
-Sources, in order: Screener (manifest) + hand-found links -> joint call -> BSE filings.
-Every source passes the same quarter check.
+Sources: Screener (manifest) + hand-found links, then joint call. Every source passes the
+same quarter check. (BSE filings were tried and dropped: BSE refuses GitHub's servers.)
 
 Resumable: saved files are skipped, so it can be rerun as late transcripts are filed.
 Files with a non-web Source (manual uploads) are never replaced; only the
 Q1 baseline is added on top of them, the transcript text is left as it is.
 """
 import csv, glob, os, re, subprocess, tempfile, time
-from datetime import date
 
 import requests
 
@@ -45,10 +44,20 @@ Q1_RE = re.compile(r"Q1\s*-?\s*(FY|F\.Y\.)\s*'?(20)?27|(first|1st) quarter (of |
                    r"quarter ended (on )?(30(th)? june,? 2026|june 30(th)?,? 2026)|"
                    r"Q1 (of )?(FY ?)?2026-27|Q1\s*(FY)?\s*2027|Q1'27", re.I)
 
+# Calendar-year reporters (Castrol, Varun Beverages...): the Sep quarter is their Q3 / nine months.
+CY_RE = re.compile(r"Q3\s*(CY|C\.Y\.)?\s*'?(20)?26\b|Q3 (of )?(CY|calendar year )?(20)?26|"
+                   r"third quarter (of )?(20|CY ?|calendar year ?)?26|"
+                   r"(nine|9) months ended (on )?(30(th)? sep|sep(tember|t)?\.? 30)", re.I)
+# Weak fallback when a call never writes "FY27": bare Q2/H1 words must outnumber bare Q1 words.
+# Tested on the 468 Q1 transcripts it wrongly passes 14 (3%), so files saved this way are flagged.
+WEAK_THIS = re.compile(r"\b(Q2|H1|second quarter|first half|september quarter|sept?(ember)?[- ]quarter)\b", re.I)
+WEAK_PREV = re.compile(r"\b(Q1|first quarter|june quarter)\b", re.I)
+
 CONFIGS = {
     # Every Oct-Dec call must pass the Q2 check (Oct-Nov also hold investor meets).
     # "Not read" = the 11 names with no Q1 call: try again for a first baseline.
-    "Q2FY27": dict(window=("2026-10", "2026-12"), this=Q2_RE, prev=Q1_RE,
+    "Q2FY27": dict(window=("2026-10", "2026-12"), this=(Q2_RE, CY_RE), prev=Q1_RE,
+                   weak_this=WEAK_THIS, weak_prev=WEAK_PREV,
                    waves=("Wave 1", "Wave 2", "Not read")),
 }
 if QUARTER not in CONFIGS:
@@ -61,11 +70,7 @@ BASELINE_MARK = "=== Q1 FY27 BASELINE"
 TRANSCRIPT_MARK = f"=== {QUARTER[:2]} FY27 TRANSCRIPT ==="
 BASELINE_SECTIONS = ("Verdict", "Promises to track", "Scores")
 
-GOOD = {"saved", "saved_bse", "saved_joint", "already_done", "manual_kept", "annual_only"}
-TRANSCRIPT_RE = re.compile(r"transcript", re.I)
-RECORDING_RE = re.compile(r"audio|recording|video", re.I)
-CALL_RE = re.compile(r"earnings call|conference call|con-?call|analyst|investors? (call|meet|conference)|"
-                     r"post[- ]results|results call", re.I)
+GOOD = {"saved", "saved_weak_match", "saved_joint", "already_done", "manual_kept", "annual_only"}
 
 OUT = f"data/queue/{QUARTER}"
 os.makedirs(OUT, exist_ok=True)
@@ -96,10 +101,15 @@ def pdf_text(url):
 
 
 def score(text):
-    """Mentions of this quarter minus mentions of the previous one (first 20k chars)."""
+    """(strength, score): 2 = names the quarter (FY27 or calendar-year wording) more than Q1 FY27;
+    1 = never names it but bare Q2/H1 words outnumber bare Q1 words (weak: flagged); 0 = reject."""
     head = text[:20000]
-    hits = len(CONFIG["this"].findall(head))
-    return hits - len(CONFIG["prev"].findall(head)) if hits else 0
+    hits = sum(len(r.findall(head)) for r in CONFIG["this"])
+    if hits:
+        sc = hits - len(CONFIG["prev"].findall(head))
+        return (2, sc) if sc > 0 else (0, sc)
+    a, b = len(CONFIG["weak_this"].findall(text)), len(CONFIG["weak_prev"].findall(text))
+    return (1, a - b) if a >= 3 and a > b else (0, a - b)
 
 
 def source_of(path):
@@ -159,103 +169,26 @@ for row in csv.DictReader(open(MANIFEST, encoding="utf-8")):
     w = CONFIG["window"]
     if w[0] <= row["period"] <= w[1] and row["url"] and row["url"] not in used_q1:
         cands.setdefault(row["code"], []).append(row)
+# Screener shows "Transcript" without a link: the call happened, transcript not attached yet
+pending = {r["code"] for r in csv.DictReader(open(MANIFEST, encoding="utf-8"))
+           if CONFIG["window"][0] <= r["period"] <= CONFIG["window"][1] and not r["url"]}
 if os.path.exists("data/extra_sources.csv"):              # hand-found links
     for r in csv.DictReader(open("data/extra_sources.csv", encoding="utf-8")):
         if r.get("quarter", QUARTER) == QUARTER and r.get("url", "").startswith("http"):
             cands.setdefault(r["code"].strip(), []).append(
                 {"code": r["code"].strip(), "period": "manual-link", "url": r["url"].strip()})
 
-# ---------- BSE filings backup ----------
-bse_code = {}
-for r in csv.DictReader(open("data/universe.csv", encoding="utf-8-sig")):
-    b = (r.get("BSE Code") or "").strip()
-    if b:
-        bse_code[b] = b
-        if (r.get("NSE Code") or "").strip():
-            bse_code[r["NSE Code"].strip()] = b
-bse = requests.Session()
-bse.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-                    "Referer": "https://www.bseindia.com/", "Origin": "https://www.bseindia.com",
-                    "Accept": "application/json, text/plain, */*"})
-BSE_API = ("https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w?pageno={page}"
-           "&strCat=-1&strPrevDate={start}&strScrip={scrip}&strSearch=P&strToDate={end}"
-           "&strType=C&subcategory=-1")
-BSE_START = CONFIG["window"][0].replace("-", "") + "01"
-
-
-def bse_announcements(scrip):
-    """All BSE announcements for the scrip since the window start. None = BSE unreachable."""
-    out = []
-    for page in range(1, 9):
-        url = BSE_API.format(page=page, start=BSE_START, scrip=scrip,
-                             end=date.today().strftime("%Y%m%d"))
-        data = None
-        for attempt in range(3):
-            try:
-                r = bse.get(url, timeout=30)
-                if r.ok:
-                    data = r.json()
-                    break
-            except (requests.RequestException, ValueError):
-                pass
-            time.sleep(5 * (attempt + 1))
-        if data is None:
-            return None if page == 1 else out
-        rows = data.get("Table") or []
-        out += rows
-        if len(rows) < 50:
-            break
-        time.sleep(1)
-    return out
-
-
-def bse_pdf(row):
-    name = (row.get("ATTACHMENTNAME") or "").strip()
-    return f"https://www.bseindia.com/xml-data/corpfiling/AttachLive/{name}" if name else ""
-
-
-def from_bse(code):
-    """Try BSE transcripts; otherwise say what BSE shows about the call."""
-    scrip = bse_code.get(code) or (code if code.isdigit() else "")
-    if not scrip:
-        return None, None, "nse_only_check_by_hand", ""
-    anns = bse_announcements(scrip)
-    if anns is None:
-        return None, None, "bse_unreachable", ""
-    time.sleep(1)
-    text_of = lambda a: f"{a.get('HEADLINE') or ''} {a.get('NEWSSUB') or ''} {a.get('SUBCATNAME') or ''}"
-    best = None
-    for a in [a for a in anns if TRANSCRIPT_RE.search(text_of(a))]:
-        url = bse_pdf(a)
-        if not url or url in used_q1:
-            continue
-        text = pdf_text(url) or pdf_text(url.replace("AttachLive", "AttachHis"))
-        time.sleep(2)
-        if text and len(text) >= MIN_CHARS:
-            sc = score(text)
-            if sc > 0 and (best is None or sc > best[0]):
-                best = (sc, {"period": (a.get("NEWS_DT") or "")[:7], "url": url}, text)
-    if best:
-        return best[1], best[2], "saved_bse", ""
-    rec = [a for a in anns if RECORDING_RE.search(text_of(a)) and CALL_RE.search(text_of(a))]
-    call = [a for a in anns if CALL_RE.search(text_of(a))]
-    if rec:
-        a = rec[0]
-        return None, None, "call_done_no_transcript", f"{(a.get('NEWS_DT') or '')[:10]} {a.get('HEADLINE') or ''}".strip()
-    if call:
-        a = call[0]
-        return None, None, "call_announced_no_transcript", f"{(a.get('NEWS_DT') or '')[:10]} {a.get('HEADLINE') or ''}".strip()
-    return None, None, "no_call_on_bse", ""
+REJECTED = os.path.join(OUT, "_rejected")
 
 
 def pick(code):
     """Download every candidate call in the window; keep the one that is most clearly
-    this quarter's results call (ties: earliest). Usually there is only one."""
+    this quarter's results call (strong match first, then score; ties: earliest).
+    Rejected texts are kept in _rejected/ so they can be checked by hand."""
     rows = sorted(cands.get(code, []), key=lambda r: r["period"])
     if not rows:
-        return None, None, "no_call_yet", ""
-    best, status = None, "not_quarter_call"
+        return None, None, ("call_done_transcript_pending" if code in pending else "no_call_yet"), ""
+    best, status, rejected = None, "not_quarter_call", []
     for row in rows:
         text = pdf_text(row["url"])
         time.sleep(2)
@@ -265,12 +198,18 @@ def pick(code):
         if len(text) < MIN_CHARS:
             status = "no_text" if best is None else status
             continue
-        sc = score(text)
-        if sc > 0 and (best is None or sc > best[0]):
-            best = (sc, row, text)
-    if best is None:                       # log the links so they can be checked by hand
+        strength, sc = score(text)
+        if strength and (best is None or (strength, sc) > best[:2]):
+            best = (strength, sc, row, text)
+        elif not strength:
+            rejected.append((row, text))
+    if best is None:                       # keep the texts and links for a hand check
+        os.makedirs(REJECTED, exist_ok=True)
+        for i, (row, text) in enumerate(rejected, 1):
+            with open(os.path.join(REJECTED, f"{safe(code)}_{i}.txt"), "w", encoding="utf-8") as f:
+                f.write(f"Code: {code}\nCall month: {row['period']}\nSource: {row['url']}\n\n{text}")
         return None, None, status, " ".join(r["url"] for r in rows)
-    return best[1], best[2], "saved", ""
+    return best[2], best[3], ("saved" if best[0] == 2 else "saved_weak_match"), ""
 
 
 companies = [r for r in csv.DictReader(open(LIST, encoding="utf-8"))
@@ -302,20 +241,10 @@ for n, c in enumerate(companies, 1):
                 row, text, _, _ = pick(partner)
             if row is not None:
                 status, note = "saved_joint", f"Joint call with {partner}"
-        if row is None and status in ("no_call_yet", "not_quarter_call", "download_failed", "no_text"):
-            screener_status, screener_links = status, source
-            brow, btext, bstatus, evidence = from_bse(code)
-            if brow is not None:
-                row, text, status, source = brow, btext, bstatus, ""
-                note = "From BSE filings (not on Screener)"
-            elif bstatus in ("bse_unreachable", "nse_only_check_by_hand"):
-                status = f"{screener_status}+{bstatus}"
-            else:
-                status = bstatus
-            if row is None:
-                source = ""
-                if screener_links:
-                    evidence = (evidence + " | Screener links: " + screener_links).strip(" |")
+        if status == "saved_weak_match":
+            note = "Weak quarter match: confirm the call date before reading"
+        if row is None:
+            evidence, source = (f"Screener links: {source}" if source else ""), ""
         if row is not None:
             picked[code] = (row, text)
             call_month, source = row["period"], row["url"]
@@ -335,7 +264,7 @@ with open(os.path.join(OUT, "_log.csv"), "w", newline="", encoding="utf-8") as f
     w.writeheader()
     w.writerows(log)
 # What needs a hand-found link: call clearly held first, then announced, then the rest
-order = {"call_done_no_transcript": 0, "call_announced_no_transcript": 1}
+order = {"call_done_transcript_pending": 0, "download_failed": 1, "no_text": 2, "not_quarter_call": 3}
 missing = sorted([l for l in log if l["status"] not in GOOD],
                  key=lambda l: (order.get(l["status"], 2), l["chain"], l["wave"]))
 with open(os.path.join(OUT, "_missing.csv"), "w", newline="", encoding="utf-8") as f:

@@ -96,8 +96,13 @@ for i, row in enumerate(rows, 1):
     found = 0
     if r is not None and r.ok:
         soup = BeautifulSoup(r.text, "html.parser")
-        for el in soup.find_all(["a", "button"]):
+        # Any tag whose own text is "Transcript": linked (<a>) or not yet linked (<div>/<span>,
+        # shown greyed by Screener when the call is held but the PDF is not attached).
+        # Innermost match only, so <a><span>Transcript</span></a> is counted once.
+        for el in soup.find_all(True):
             if el.get_text(strip=True).lower() != "transcript":
+                continue
+            if any(ch.get_text(strip=True).lower() == "transcript" for ch in el.find_all(True)):
                 continue
             m = find_date(el)
             if not m:
@@ -107,6 +112,8 @@ for i, row in enumerate(rows, 1):
                 continue
             period = f"{m.group(2)}-{MON[m.group(1)]:02d}"
             url = link_of(el, r.url)
+            if not url and el.find_parent("a") is not None:
+                url = link_of(el.find_parent("a"), r.url)
             key = (code, period, url)
             if key in seen:
                 continue
