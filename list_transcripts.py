@@ -3,6 +3,10 @@
 Reads  data/universe.csv  (the private data repo, checked out into ./data)
 Writes data/manifest.csv  one row per transcript, status = pending
 
+ONLY_LIST=1: scan only the tracking list (data/value_chain_leaders.csv) and MERGE
+into the existing manifest: a company's rows are replaced only if its page loaded,
+so a failed fetch never wipes earlier rows. Used for the quarterly refresh.
+
 Fixes from the counting run:
 - finds the date by walking up from the Transcript link, not only from its <li>
 - records transcripts whose link has no URL, instead of silently skipping them
@@ -17,7 +21,9 @@ from bs4 import BeautifulSoup
 
 UNIVERSE = "data/universe.csv"
 MANIFEST = "data/manifest.csv"
+LIST = "data/value_chain_leaders.csv"
 LIMIT = int(os.environ.get("LIMIT") or 0)
+ONLY_LIST = os.environ.get("ONLY_LIST") == "1"
 
 MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
@@ -73,11 +79,15 @@ def link_of(el, base):
     return ""
 
 
-rows = list(csv.DictReader(open(UNIVERSE, encoding="utf-8-sig")))
+if ONLY_LIST:
+    rows = [{"NSE Code": r["Code"], "Name": r["Company"], "Industry": r["Sub-industry"]}
+            for r in csv.DictReader(open(LIST, encoding="utf-8"))]
+else:
+    rows = list(csv.DictReader(open(UNIVERSE, encoding="utf-8-sig")))
 if LIMIT:
     rows = rows[:LIMIT]
 
-out, seen = [], set()
+out, seen, scanned = [], set(), set()
 for i, row in enumerate(rows, 1):
     code = (row.get("NSE Code") or "").strip() or (row.get("BSE Code") or "").strip()
     if not code:
@@ -106,9 +116,18 @@ for i, row in enumerate(rows, 1):
                         "industry": row.get("Industry", ""),
                         "period": period, "url": url,
                         "status": "pending" if url else "no_link"})
+    if r is not None and r.ok:
+        scanned.add(code)
     status = r.status_code if r is not None else "error"
     print(f"{i}/{len(rows)} {row['Name']}: page {status}, transcripts {found}", flush=True)
     time.sleep(2)
+
+if ONLY_LIST and os.path.exists(MANIFEST):
+    kept = [m for m in csv.DictReader(open(MANIFEST, encoding="utf-8"))
+            if m["code"] not in scanned]
+    print(f"Merge: kept {len(kept)} rows of companies not rescanned, "
+          f"replaced rows for {len(scanned)} companies")
+    out = kept + out
 
 with open(MANIFEST, "w", newline="", encoding="utf-8") as f:
     w = csv.DictWriter(f, fieldnames=["code", "name", "industry", "period", "url", "status"])

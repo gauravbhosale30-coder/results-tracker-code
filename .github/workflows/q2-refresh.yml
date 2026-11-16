@@ -1,0 +1,61 @@
+name: Q2 refresh (list + fetch)
+# Refreshes the transcript list for the tracking list only, then fetches new Q2 FY27
+# calls into queue/Q2FY27. Safe to rerun: saved and hand-supplied files are kept.
+# Runs Mon and Thu 09:00 IST; stops itself after 20 Dec 2026 (or start it by hand).
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "How many companies (0 = all)"
+        default: "0"
+  schedule:
+    - cron: "30 3 * * 1,4"
+concurrency: data-repo-write
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - id: gate
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "$(date -u +%Y%m%d)" -gt 20261220 ]; then
+            echo "go=false" >> "$GITHUB_OUTPUT"; echo "Q2 window over: nothing to do"
+          else
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.gate.outputs.go == 'true'
+        uses: actions/checkout@v4
+      - if: steps.gate.outputs.go == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: gauravbhosale30-coder/results-tracker-data
+          token: ${{ secrets.DATA_REPO_TOKEN }}
+          path: data
+      - if: steps.gate.outputs.go == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - if: steps.gate.outputs.go == 'true'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq poppler-utils && pip install requests beautifulsoup4
+      - name: Refresh transcript list (tracking list only)
+        if: steps.gate.outputs.go == 'true'
+        run: python list_transcripts.py
+        env:
+          ONLY_LIST: "1"
+          LIMIT: ${{ inputs.limit || '0' }}
+      - name: Fetch Q2 FY27 calls
+        if: steps.gate.outputs.go == 'true'
+        run: python fetch_queue.py
+        env:
+          QUARTER: Q2FY27
+          LIMIT: ${{ inputs.limit || '0' }}
+      - name: Save to the private data repo
+        if: always() && steps.gate.outputs.go == 'true'
+        run: |
+          cd data
+          git config user.name "tracker-bot"
+          git config user.email "tracker-bot@users.noreply.github.com"
+          git add manifest.csv queue/Q2FY27
+          git commit -m "Q2 FY27 refresh: manifest and reading queue" || echo "No changes"
+          git pull --rebase
+          git push

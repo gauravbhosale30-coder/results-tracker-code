@@ -1,7 +1,10 @@
-name: Fetch Q1 queue
+name: Fetch queue
 on:
   workflow_dispatch:
     inputs:
+      quarter:
+        description: "Quarter to fetch"
+        default: "Q2FY27"
       limit:
         description: "How many companies (0 = all)"
         default: "0"
@@ -23,6 +26,7 @@ jobs:
       - run: pip install requests
       - run: python fetch_queue.py
         env:
+          QUARTER: ${{ inputs.quarter }}
           LIMIT: ${{ inputs.limit }}
       - name: Save queue to the private data repo
         if: always()
@@ -31,5 +35,6 @@ jobs:
           git config user.name "tracker-bot"
           git config user.email "tracker-bot@users.noreply.github.com"
           git add queue
-          git commit -m "Q1 FY27 reading queue" || echo "No changes"
+          git commit -m "${{ inputs.quarter }} reading queue" || echo "No changes"
+          git pull --rebase
           git push
