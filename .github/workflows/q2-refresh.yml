@@ -1,7 +1,7 @@
 name: Q2 refresh (list + fetch)
 # Refreshes the transcript list for the tracking list only, then fetches new Q2 FY27
 # calls into queue/Q2FY27. Safe to rerun: saved and hand-supplied files are kept.
-# Runs Mon and Thu 09:00 IST; stops itself after 20 Dec 2026 (or start it by hand).
+# Runs Mon and Thu 09:00 IST and after code changes; schedule stops after 20 Dec 2026.
 on:
   workflow_dispatch:
     inputs:
@@ -10,6 +10,9 @@ on:
         default: "0"
   schedule:
     - cron: "30 3 * * 1,4"
+  push:                       # a code change to the fetch also runs it once (full list)
+    branches: [main]
+    paths: [fetch_queue.py, list_transcripts.py, .github/workflows/q2-refresh.yml]
 concurrency: data-repo-write
 jobs:
   refresh:

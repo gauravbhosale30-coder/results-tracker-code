@@ -7,14 +7,21 @@ Reads  data/value_chain_leaders.csv  (companies to read)
        data/manifest.csv             (every transcript link, from list_transcripts.py)
        data/records/Q1FY27/          (Q1 records: baseline put on top of each Q2 file)
        data/q2_checklist.csv         (report Section 7 promises to test in Q2)
+       data/extra_sources.csv        (hand-found transcript links, e.g. company websites)
+       data/universe.csv             (BSE codes for the BSE-filings backup)
 Writes data/queue/<QUARTER>/<CODE>.txt  one text file per company
        data/queue/<QUARTER>/_log.csv    status per company
+       data/queue/<QUARTER>/_missing.csv  companies still without a transcript, with BSE evidence
+
+Sources, in order: Screener (manifest) + hand-found links -> joint call -> BSE filings.
+Every source passes the same quarter check.
 
 Resumable: saved files are skipped, so it can be rerun as late transcripts are filed.
 Files with a non-web Source (manual uploads) are never replaced; only the
 Q1 baseline is added on top of them, the transcript text is left as it is.
 """
 import csv, glob, os, re, subprocess, tempfile, time
+from datetime import date
 
 import requests
 
@@ -53,6 +60,12 @@ JOINT_CALL = {"BHARTIHEXA": "BHARTIARTL"}  # Hexacom notes come from Airtel's ca
 BASELINE_MARK = "=== Q1 FY27 BASELINE"
 TRANSCRIPT_MARK = f"=== {QUARTER[:2]} FY27 TRANSCRIPT ==="
 BASELINE_SECTIONS = ("Verdict", "Promises to track", "Scores")
+
+GOOD = {"saved", "saved_bse", "saved_joint", "already_done", "manual_kept", "annual_only"}
+TRANSCRIPT_RE = re.compile(r"transcript", re.I)
+RECORDING_RE = re.compile(r"audio|recording|video", re.I)
+CALL_RE = re.compile(r"earnings call|conference call|con-?call|analyst|investors? (call|meet|conference)|"
+                     r"post[- ]results|results call", re.I)
 
 OUT = f"data/queue/{QUARTER}"
 os.makedirs(OUT, exist_ok=True)
@@ -146,6 +159,94 @@ for row in csv.DictReader(open(MANIFEST, encoding="utf-8")):
     w = CONFIG["window"]
     if w[0] <= row["period"] <= w[1] and row["url"] and row["url"] not in used_q1:
         cands.setdefault(row["code"], []).append(row)
+if os.path.exists("data/extra_sources.csv"):              # hand-found links
+    for r in csv.DictReader(open("data/extra_sources.csv", encoding="utf-8")):
+        if r.get("quarter", QUARTER) == QUARTER and r.get("url", "").startswith("http"):
+            cands.setdefault(r["code"].strip(), []).append(
+                {"code": r["code"].strip(), "period": "manual-link", "url": r["url"].strip()})
+
+# ---------- BSE filings backup ----------
+bse_code = {}
+for r in csv.DictReader(open("data/universe.csv", encoding="utf-8-sig")):
+    b = (r.get("BSE Code") or "").strip()
+    if b:
+        bse_code[b] = b
+        if (r.get("NSE Code") or "").strip():
+            bse_code[r["NSE Code"].strip()] = b
+bse = requests.Session()
+bse.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+                    "Referer": "https://www.bseindia.com/", "Origin": "https://www.bseindia.com",
+                    "Accept": "application/json, text/plain, */*"})
+BSE_API = ("https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w?pageno={page}"
+           "&strCat=-1&strPrevDate={start}&strScrip={scrip}&strSearch=P&strToDate={end}"
+           "&strType=C&subcategory=-1")
+BSE_START = CONFIG["window"][0].replace("-", "") + "01"
+
+
+def bse_announcements(scrip):
+    """All BSE announcements for the scrip since the window start. None = BSE unreachable."""
+    out = []
+    for page in range(1, 9):
+        url = BSE_API.format(page=page, start=BSE_START, scrip=scrip,
+                             end=date.today().strftime("%Y%m%d"))
+        data = None
+        for attempt in range(3):
+            try:
+                r = bse.get(url, timeout=30)
+                if r.ok:
+                    data = r.json()
+                    break
+            except (requests.RequestException, ValueError):
+                pass
+            time.sleep(5 * (attempt + 1))
+        if data is None:
+            return None if page == 1 else out
+        rows = data.get("Table") or []
+        out += rows
+        if len(rows) < 50:
+            break
+        time.sleep(1)
+    return out
+
+
+def bse_pdf(row):
+    name = (row.get("ATTACHMENTNAME") or "").strip()
+    return f"https://www.bseindia.com/xml-data/corpfiling/AttachLive/{name}" if name else ""
+
+
+def from_bse(code):
+    """Try BSE transcripts; otherwise say what BSE shows about the call."""
+    scrip = bse_code.get(code) or (code if code.isdigit() else "")
+    if not scrip:
+        return None, None, "nse_only_check_by_hand", ""
+    anns = bse_announcements(scrip)
+    if anns is None:
+        return None, None, "bse_unreachable", ""
+    time.sleep(1)
+    text_of = lambda a: f"{a.get('HEADLINE') or ''} {a.get('NEWSSUB') or ''} {a.get('SUBCATNAME') or ''}"
+    best = None
+    for a in [a for a in anns if TRANSCRIPT_RE.search(text_of(a))]:
+        url = bse_pdf(a)
+        if not url or url in used_q1:
+            continue
+        text = pdf_text(url) or pdf_text(url.replace("AttachLive", "AttachHis"))
+        time.sleep(2)
+        if text and len(text) >= MIN_CHARS:
+            sc = score(text)
+            if sc > 0 and (best is None or sc > best[0]):
+                best = (sc, {"period": (a.get("NEWS_DT") or "")[:7], "url": url}, text)
+    if best:
+        return best[1], best[2], "saved_bse", ""
+    rec = [a for a in anns if RECORDING_RE.search(text_of(a)) and CALL_RE.search(text_of(a))]
+    call = [a for a in anns if CALL_RE.search(text_of(a))]
+    if rec:
+        a = rec[0]
+        return None, None, "call_done_no_transcript", f"{(a.get('NEWS_DT') or '')[:10]} {a.get('HEADLINE') or ''}".strip()
+    if call:
+        a = call[0]
+        return None, None, "call_announced_no_transcript", f"{(a.get('NEWS_DT') or '')[:10]} {a.get('HEADLINE') or ''}".strip()
+    return None, None, "no_call_on_bse", ""
 
 
 def pick(code):
@@ -182,7 +283,7 @@ log, picked = [], {}
 for n, c in enumerate(companies, 1):
     code = c["Code"]
     path = os.path.join(OUT, safe(code) + ".txt")
-    call_month, source = "", ""
+    call_month, source, evidence = "", "", ""
     if os.path.exists(path) and not source_of(path).startswith("http"):
         status = "manual_kept"                        # user-supplied: never replaced
         source = source_of(path) or "manual"
@@ -201,6 +302,20 @@ for n, c in enumerate(companies, 1):
                 row, text, _, _ = pick(partner)
             if row is not None:
                 status, note = "saved_joint", f"Joint call with {partner}"
+        if row is None and status in ("no_call_yet", "not_quarter_call", "download_failed", "no_text"):
+            screener_status, screener_links = status, source
+            brow, btext, bstatus, evidence = from_bse(code)
+            if brow is not None:
+                row, text, status, source = brow, btext, bstatus, ""
+                note = "From BSE filings (not on Screener)"
+            elif bstatus in ("bse_unreachable", "nse_only_check_by_hand"):
+                status = f"{screener_status}+{bstatus}"
+            else:
+                status = bstatus
+            if row is None:
+                source = ""
+                if screener_links:
+                    evidence = (evidence + " | Screener links: " + screener_links).strip(" |")
         if row is not None:
             picked[code] = (row, text)
             call_month, source = row["period"], row["url"]
@@ -209,13 +324,25 @@ for n, c in enumerate(companies, 1):
                 f.write(baseline(code) + TRANSCRIPT_MARK + "\n\n")
                 f.write(text)
     log.append({"wave": c["Read wave"], "code": code, "company": c["Company"],
-                "call_month": call_month, "status": status, "source": source})
+                "chain": c["Value chain"], "sub_industry": c["Sub-industry"],
+                "call_month": call_month, "status": status, "source": source,
+                "evidence": evidence})
     print(f"{n}/{len(companies)} {c['Company']}: {status}", flush=True)
 
+FIELDS = ["wave", "code", "company", "chain", "sub_industry", "call_month", "status", "source", "evidence"]
 with open(os.path.join(OUT, "_log.csv"), "w", newline="", encoding="utf-8") as f:
-    w = csv.DictWriter(f, fieldnames=["wave", "code", "company", "call_month", "status", "source"])
+    w = csv.DictWriter(f, fieldnames=FIELDS)
     w.writeheader()
     w.writerows(log)
+# What needs a hand-found link: call clearly held first, then announced, then the rest
+order = {"call_done_no_transcript": 0, "call_announced_no_transcript": 1}
+missing = sorted([l for l in log if l["status"] not in GOOD],
+                 key=lambda l: (order.get(l["status"], 2), l["chain"], l["wave"]))
+with open(os.path.join(OUT, "_missing.csv"), "w", newline="", encoding="utf-8") as f:
+    w = csv.DictWriter(f, fieldnames=FIELDS)
+    w.writeheader()
+    w.writerows(missing)
+print(f"Missing a transcript: {len(missing)} (see _missing.csv)")
 
 counts = {}
 for l in log:
