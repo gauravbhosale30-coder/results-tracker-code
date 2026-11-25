@@ -40,13 +40,16 @@ if QUARTER not in CONFIGS:
 CONFIG = CONFIGS[QUARTER]
 
 ANNUAL_ONLY = {"WEALTH"}                 # Wealth First: annual (Q4) call only
+# Companies confirmed by Gaurav to have held no call this quarter (data/no_call.csv: code,quarter,note)
+NO_CALL = {r["code"].strip() for r in csv.DictReader(open("data/no_call.csv", encoding="utf-8"))
+           if r["quarter"].strip() == QUARTER} if os.path.exists("data/no_call.csv") else set()
 JOINT_CALL = {"BHARTIHEXA": "BHARTIARTL"}  # Hexacom notes come from Airtel's call
 BASELINE_MARK = "=== Q1 FY27 BASELINE"
 TRANSCRIPT_MARK = f"=== {QUARTER[:2]} FY27 TRANSCRIPT ==="
 BASELINE_SECTIONS = ("Verdict", "Promises to track", "Scores")
 
 GOOD = {"saved", "saved_weak_match", "saved_joint", "already_done", "manual_kept", "annual_only",
-        "saved_audio"}
+        "saved_audio", "no_call_held"}
 AUDIO_MARK = "Source type: audio"            # header line written by transcribe_audio.py
 
 OUT = f"data/queue/{QUARTER}"
@@ -224,6 +227,8 @@ for n, c in enumerate(companies, 1):
         add_baseline_to_manual(path, code)
     elif code in ANNUAL_ONLY:
         status = "annual_only"
+    elif code in NO_CALL:
+        status = "no_call_held"
     else:
         audio_path = path if os.path.exists(path) else None
         row, text, status, source = pick(code)
