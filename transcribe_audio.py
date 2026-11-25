@@ -46,8 +46,11 @@ LOG_FIELDS = ["code", "company", "url", "status", "audio_min", "note", "run_date
 FYS = r"(FY|F ?by|F5|AY|F\.Y\.|F Y|fiscal( year)?|financial year)"     # how Whisper writes "FY"
 AUDIO_THIS = re.compile(r"\b[QH]2,? ?(of )?(the )?" + FYS + r" ?[-']?(20)?27\b|"
                         r"\b(first half|H1) (of )?(the )?(FY|fiscal( year)?|financial year) ?'?(20)?27\b", re.I)
-AUDIO_PREV = re.compile(r"\bQ1,? ?(of )?(the )?" + FYS + r" ?[-']?(20)?27\b", re.I)
-CONFIG["this"] = tuple(CONFIG["this"]) + (AUDIO_THIS,)
+AUDIO_PREV = re.compile(r"\bQ1,? ?(of )?(the )?" + FYS + r" ?[-']?(20)?27\b|"
+                        r"(quarter|three months) ended (on )?(30(th)? )?june,? 2026", re.I)
+# Spoken period without the day: "the quarter ended September 2026" (IRB InvIT was wrongly rejected)
+AUDIO_THIS2 = re.compile(r"(quarter|half[- ]?year|six months) ended (on )?(30(th)? )?sep(tember|t)?\.?,? 2026", re.I)
+CONFIG["this"] = tuple(CONFIG["this"]) + (AUDIO_THIS, AUDIO_THIS2)
 CONFIG["prev"] = re.compile(f"(?:{CONFIG['prev'].pattern})|(?:{AUDIO_PREV.pattern})", re.I)
 
 PROMPT = ("Quarterly earnings conference call of an Indian listed company. Figures in rupees crore. "
