@@ -394,7 +394,7 @@ def run():
                 continue
             took = (time.time() - t0) / 60
             print(f"{code}: {mins:.0f} min audio transcribed in {took:.0f} min, {len(text)} chars", flush=True)
-            if len(text) < 3000:
+            if len(text) < 3000 and not test:
                 row["status"], row["note"] = "no_speech", f"only {len(text)} characters of speech"
                 continue
             strength, sc = (2, 0) if test else score(text, CONFIG)
