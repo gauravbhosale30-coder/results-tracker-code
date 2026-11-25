@@ -151,7 +151,11 @@ def transcribe(wav):
     from faster_whisper import WhisperModel
     if _model is None:
         _model = WhisperModel(MODEL, device="cpu", compute_type="int8", cpu_threads=os.cpu_count() or 4)
-    segs, _ = _model.transcribe(wav, language="en", beam_size=5, vad_filter=True,
+    import numpy as np                     # decode with ffmpeg: faster-whisper's own decoder (PyAV) breaks across versions
+    raw = subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-i", wav, "-f", "f32le",
+                          "-ac", "1", "-ar", "16000", "-"], capture_output=True, check=True).stdout
+    audio = np.frombuffer(raw, dtype=np.float32)
+    segs, _ = _model.transcribe(audio, language="en", beam_size=5, vad_filter=True,
                                 initial_prompt=PROMPT, condition_on_previous_text=False)
     paras, cur, last_end = [], [], None
     for sg in segs:
@@ -314,7 +318,12 @@ def run():
                 row["status"], row["note"] = "too_long", f"{mins:.0f} min recording"
                 continue
             t0 = time.time()
-            text = transcribe(wav)
+            try:
+                text = transcribe(wav)
+            except Exception as e:                        # one bad file must not stop the shard
+                row["status"], row["note"] = "transcribe_failed", f"{type(e).__name__}: {e}"[:200]
+                print(f"{code}: transcription failed: {e}", flush=True)
+                continue
             took = (time.time() - t0) / 60
             print(f"{code}: {mins:.0f} min audio transcribed in {took:.0f} min, {len(text)} chars", flush=True)
             if len(text) < 3000:
