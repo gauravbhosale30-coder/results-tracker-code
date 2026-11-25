@@ -26,7 +26,6 @@ on:
       model:
         description: "Whisper model"
         default: "large-v3"
-concurrency: audio-transcribe    # one run at a time; a second one waits, then finds the work done
 env:
   QUARTER: Q2FY27
   CODES: ${{ inputs.codes }}
@@ -96,7 +95,6 @@ jobs:
     needs: [plan, transcribe]
     if: always() && needs.plan.outputs.count != '0' && inputs.test_url == ''
     runs-on: ubuntu-latest
-    concurrency: data-repo-write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
@@ -124,5 +122,6 @@ jobs:
           git config user.email "tracker-bot@users.noreply.github.com"
           git add queue/Q2FY27
           git commit -m "Q2 FY27 audio transcripts" || echo "No changes"
-          git pull --rebase
-          git push
+          # no concurrency lock (a queued lock cancels older waiting runs and loses their transcripts):
+          # retry the push if another run wrote to the data repo meanwhile
+          for i in 1 2 3 4 5; do git pull --rebase && git push && break; sleep $((i*20)); done
