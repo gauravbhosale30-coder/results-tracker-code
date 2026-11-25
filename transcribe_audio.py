@@ -135,7 +135,7 @@ def download(url, dest):
 
 def download_once(url, dest, verify):
     try:
-        with s.get(url, stream=True, timeout=60, verify=verify) as r:
+        with s.get(url, stream=True, timeout=(30, 300), verify=verify) as r:
             ctype = r.headers.get("content-type", "")
             if r.ok and ("audio" in ctype or "video" in ctype or "octet-stream" in ctype
                          or (is_audio(url) and "html" not in ctype)):
