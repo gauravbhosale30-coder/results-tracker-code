@@ -7,6 +7,8 @@ on:
   workflow_run:
     workflows: ["Q2 refresh (list + fetch)"]
     types: [completed]
+  schedule:                  # backup in case the after-refresh trigger does not fire
+    - cron: "0 7 * * 1,4"    # Mon and Thu 12:30 IST, after the 09:00 IST refresh
   workflow_dispatch:
     inputs:
       codes:
@@ -24,6 +26,7 @@ on:
       model:
         description: "Whisper model"
         default: "large-v3"
+concurrency: audio-transcribe    # one run at a time; a second one waits, then finds the work done
 env:
   QUARTER: Q2FY27
   CODES: ${{ inputs.codes }}
