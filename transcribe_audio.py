@@ -344,6 +344,9 @@ def run():
             with open(f"{OUT}/queue/{safe(code)}.txt", "w", encoding="utf-8") as f:
                 f.write(header(c, call_month, url, note))
                 f.write(checks + "=== AUDIO TRANSCRIPT ([h:mm:ss] = time in the recording) ===\n\n" + text + "\n")
+            if test:                                  # test: show the result in the run log
+                print("=====TEST OUTPUT START=====\n" + open(f"{OUT}/queue/{safe(code)}.txt", encoding="utf-8").read()
+                      + "\n=====TEST OUTPUT END=====", flush=True)
             break                                     # one good call per company is enough
     with open(f"{OUT}/audio_log_{os.environ.get('SHARD', '0')}.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=LOG_FIELDS)
