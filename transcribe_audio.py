@@ -128,6 +128,12 @@ def ca_bundle_for(url):
 
 def download(url, dest):
     """Direct media file first; web pages (YouTube, webcast players) through yt-dlp."""
+    if url.startswith("repo:"):            # recording uploaded by hand into the private data repo
+        path = os.path.join("data", url[5:])
+        if not os.path.exists(path):
+            return f"uploaded file not found: {path}"
+        shutil.copy(path, dest)
+        return None
     err = download_once(url, dest, True)
     if err and "SSL" in err:
         bundle = ca_bundle_for(url)
