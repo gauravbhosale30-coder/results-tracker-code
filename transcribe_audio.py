@@ -33,7 +33,7 @@ MANIFEST = "data/manifest.csv"
 QUEUE = f"data/queue/{QUARTER}"
 AUDIO_LOG = f"{QUEUE}/_audio_log.csv"
 OUT = "out"
-MODEL = os.environ.get("WHISPER_MODEL") or "distil-large-v3"
+MODEL = os.environ.get("WHISPER_MODEL") or "large-v3"      # distil-large-v3 garbled figures in the GAIL test
 MAX_SHARDS = 20
 BUDGET_MIN = float(os.environ.get("BUDGET_MIN") or 300)   # stop starting new files after this
 MAX_AUDIO_MIN = 240                                         # longer files are skipped
@@ -43,9 +43,10 @@ FINAL_FAIL = {"not_quarter_call", "no_speech", "too_long"}
 LOG_FIELDS = ["code", "company", "url", "status", "audio_min", "note", "run_date"]
 
 # Spoken forms Whisper writes that the PDF patterns miss ("Q2 of FY27", "first half of FY27")
-AUDIO_THIS = re.compile(r"\b[QH]2,? (of )?(the )?(FY|fiscal|financial year) ?'?(20)?27\b|"
+FYS = r"(FY|F ?by|F5|AY|F\.Y\.|F Y|fiscal( year)?|financial year)"     # how Whisper writes "FY"
+AUDIO_THIS = re.compile(r"\b[QH]2,? ?(of )?(the )?" + FYS + r" ?[-']?(20)?27\b|"
                         r"\b(first half|H1) (of )?(the )?(FY|fiscal( year)?|financial year) ?'?(20)?27\b", re.I)
-AUDIO_PREV = re.compile(r"\bQ1,? (of )?(the )?(FY|fiscal|financial year) ?'?(20)?27\b", re.I)
+AUDIO_PREV = re.compile(r"\bQ1,? ?(of )?(the )?" + FYS + r" ?[-']?(20)?27\b", re.I)
 CONFIG["this"] = tuple(CONFIG["this"]) + (AUDIO_THIS,)
 CONFIG["prev"] = re.compile(f"(?:{CONFIG['prev'].pattern})|(?:{AUDIO_PREV.pattern})", re.I)
 
@@ -173,19 +174,24 @@ def transcribe(wav):
 
 
 # ---------------- number check ----------------
+# Reported rows on Screener's quarterly table, and the words used for them on a call
+# (incl. Whisper's usual mishearings: EBITDA -> "Vita", PBT -> "PVT").
 METRICS = [
     ("Revenue", re.compile(r"^(Sales|Revenue)", re.I),
      re.compile(r"revenue|income from operations|turnover|top ?line|\bsales\b|total income|net interest income|\bNII\b", re.I)),
     ("Operating profit / EBITDA", re.compile(r"^(Operating Profit|Financing Profit)", re.I),
-     re.compile(r"EBITDA|operating profit|operating income|pre[- ]provision|\bPPOP\b|\bEBIT\b", re.I)),
+     re.compile(r"EBITDA|E?B?IT ?DA|\bVita\b|operating profit|operating income|pre[- ]provision|\bPPOP\b|\bEBIT\b", re.I)),
+    ("Profit before tax", re.compile(r"^Profit before tax", re.I),
+     re.compile(r"\bPBT\b|\bPVT\b|profit before tax", re.I)),
     ("Net profit", re.compile(r"^Net Profit", re.I),
-     re.compile(r"\bPAT\b|net profit|profit after tax|bottom ?line|net income|profit for the (quarter|period)", re.I)),
+     re.compile(r"\bPAT\b|net profit|profit after tax|bottom ?line|net income|profit for the (quarter|period)|minority interest", re.I)),
 ]
-NUM = re.compile(r"(\d{1,3}(?:,\d{2,3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*"
-                 r"(lakh crores?|lac crores?|thousand crores?|crores?|crs?\b|cr\.|billion|bn\b|"
+NUM = re.compile(r"(\d[\d,]*(?:\.\d+)?)\s*(lakh crores?|lac crores?|thousand crores?|crores?|crs?\b|cr\.|billion|bn\b|"
                  r"million|mn\b|lakhs?\b|lacs?\b)", re.I)
+VALID = re.compile(r"^(\d{1,3}(,\d{3})+|\d{1,2}(,\d{2})*,\d{3}|\d+)(\.\d+)?$")   # 1,234,567 / 12,34,567 / 1234
 UNIT = [("lakh cr", 1e5), ("lac cr", 1e5), ("thousand", 1e3), ("cr", 1), ("billion", 100), ("bn", 100),
         ("million", 0.1), ("mn", 0.1), ("lakh", 0.01), ("lac", 0.01)]
+MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
 
 def to_crore(num, unit):
@@ -196,8 +202,16 @@ def to_crore(num, unit):
     return None
 
 
-def screener_results(code, col):
-    """{'Consolidated'|'Standalone': {row label: value in Rs cr}} for one results column."""
+def periods(col):
+    """This quarter, the quarter before, the same quarter last year ("Sep 2026" -> Jun 2026, Sep 2025)."""
+    m, y = col.split()
+    i = MON.index(m)
+    prev = f"{MON[(i - 3) % 12]} {y if i >= 3 else int(y) - 1}"
+    return [("this quarter", col), ("previous quarter", prev), ("same quarter last year", f"{m} {int(y) - 1}")]
+
+
+def screener_results(code, cols):
+    """{column: {'Consolidated'|'Standalone': {row label: value in Rs cr}}}."""
     from bs4 import BeautifulSoup
     res = {}
     for kind, path in (("Consolidated", "consolidated/"), ("Standalone", "")):
@@ -205,72 +219,92 @@ def screener_results(code, col):
             r = s.get(f"https://www.screener.in/company/{code}/{path}", timeout=30)
         except requests.RequestException:
             continue
-        if not r.ok:
-            continue
-        sec = BeautifulSoup(r.text, "html.parser").find("section", id="quarters")
+        time.sleep(2)
+        sec = BeautifulSoup(r.text, "html.parser").find("section", id="quarters") if r.ok else None
         table = sec.find("table") if sec else None
         if not table:
             continue
         heads = [th.get_text(strip=True) for th in table.find_all("th")]
-        if col not in heads:
-            continue
-        i, rows = heads.index(col), {}
-        for tr in table.find_all("tr"):
-            cells = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
-            if len(cells) > i:
-                try:
-                    rows[cells[0].replace("+", "").strip()] = float(cells[i].replace(",", "").replace("%", ""))
-                except ValueError:
-                    pass
-        if rows:
-            res[kind] = rows
-        time.sleep(2)
+        for col in cols:
+            if col not in heads:
+                continue
+            i = heads.index(col)
+            for tr in table.find_all("tr"):
+                cells = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
+                if len(cells) > i:
+                    try:
+                        v = float(cells[i].replace(",", "").replace("%", ""))
+                    except ValueError:
+                        continue
+                    res.setdefault(col, {}).setdefault(kind, {})[cells[0].replace("+", "").strip()] = v
     return res
+
+
+def stamp(text, pos):
+    m = None
+    for m in re.finditer(r"\[\d+:\d\d:\d\d\]", text[:pos]):
+        pass
+    return m.group(0) if m else ""
 
 
 def number_check(code, text, col):
     """Lines for the queue file and a one-line summary."""
-    reported = screener_results(code, col)
-    lines = [f"=== NUMBER CHECK: recording vs reported results (Screener, Rs cr, {col}) ===",
-             "matched = said figure within 2.5% of reported; check by hand = a nearby figure is off by "
-             "2.5-35% (misheard, or a segment / standalone / adjusted figure); not said = no figure found."]
-    if not reported:
-        lines.append("Reported results not found on Screener for this column: check all numbers by hand.")
-        return "\n".join(lines) + "\n\n", "number check not possible (no Screener results)"
-    found = [(m.start(), to_crore(m.group(1), m.group(2)), m.group(0)) for m in NUM.finditer(text)]
+    pers = periods(col)
+    reported = screener_results(code, [c for _, c in pers])
+    lines = [f"=== NUMBER CHECK: recording vs reported results (Screener, Rs cr) ===",
+             "MATCHED = a figure said near the item is within 2.5% of the reported one. "
+             "CHECK BY HAND = the nearest figure said is 2.5-35% off (misheard, or a segment / "
+             "standalone / adjusted figure). NOT SAID = no figure found for it."]
+    found = [(m.start(), to_crore(m.group(1), m.group(2)), m.group(0).strip()) for m in NUM.finditer(text)]
     found = [f for f in found if f[1]]
     tally = {"matched": 0, "check by hand": 0, "not said": 0}
-    for name, row_re, kw in METRICS:
-        values = {k: v for k, rows in reported.items() for lab, v in rows.items() if row_re.match(lab)}
-        if not values or all(abs(v) < 1 for v in values.values()):
+    if not reported:
+        lines.append("Reported results not found on Screener: check every figure by hand.")
+    for label, c in pers:
+        if c not in reported:
             continue
-        near = []
-        for m in kw.finditer(text):
-            near += [f for f in found if m.start() <= f[0] <= m.start() + 220]
-        best = None                       # (relative gap, said text, basis, reported value)
-        for basis, rv in values.items():
-            for pos, cr, said in near:
-                gap = abs(cr - rv) / abs(rv)
-                if best is None or gap < best[0]:
-                    best = (gap, said, basis, rv)
-            for pos, cr, said in found:   # exact figure said anywhere in the call
-                gap = abs(cr - rv) / abs(rv)
-                if gap <= 0.01 and (best is None or gap < best[0]):
-                    best = (gap, said, basis, rv)
-        rep = ", ".join(f"{k} {v:,.0f}" for k, v in values.items())
-        if best and best[0] <= 0.025:
-            verdict = "matched"
-            detail = f'said "{best[1]}" vs {best[2].lower()} {best[3]:,.0f}'
-        elif best and best[0] <= 0.35:
-            verdict = "check by hand"
-            detail = f'closest said "{best[1]}" ({best[0]:.0%} off) vs reported {rep}'
-        else:
-            verdict = "not said"
-            detail = f"reported {rep}"
-        tally[verdict] += 1
-        lines.append(f"- {name}: {verdict.upper()} ({detail})")
-    summary = ", ".join(f"{v} {k}" for k, v in tally.items())
-    return "\n".join(lines) + "\n\n", f"number check: {summary}"
+        lines.append(f"{label.capitalize()} ({c}):")
+        for name, row_re, kw in METRICS:
+            values = {k: v for k, rows in reported[c].items() for lab, v in rows.items() if row_re.match(lab)}
+            if not values or all(abs(v) < 1 for v in values.values()):
+                continue
+            near = []
+            for m in kw.finditer(text):
+                near += [f for f in found if m.start() <= f[0] <= m.start() + 220]
+            best = None                   # (gap, said, basis, reported, position)
+            for basis, rv in values.items():
+                for pos, cr, said in near:
+                    gap = abs(cr - rv) / abs(rv)
+                    if best is None or gap < best[0]:
+                        best = (gap, said, basis, rv, pos)
+                for pos, cr, said in found:   # the exact figure said anywhere
+                    gap = abs(cr - rv) / abs(rv)
+                    if gap <= 0.01 and (best is None or gap < best[0]):
+                        best = (gap, said, basis, rv, pos)
+            rep = ", ".join(f"{k.lower()} {v:,.0f}" for k, v in values.items())
+            if best and best[0] <= 0.015:
+                verdict, detail = "matched", f'said "{best[1]}" {stamp(text, best[4])} vs {best[2].lower()} {best[3]:,.0f}'
+            elif best and best[0] <= 0.35:
+                verdict, detail = "check by hand", (f'nearest said "{best[1]}" {stamp(text, best[4])} '
+                                                    f'({best[0]:.0%} off) vs reported {rep}')
+            else:
+                verdict, detail = "not said", f"reported {rep}"
+            if label == "this quarter":
+                tally[verdict] += 1
+            lines.append(f"- {name}: {verdict.upper()} ({detail})")
+    # Figures Whisper probably garbled: impossible digit grouping, or far out of scale for the company
+    scale = max([v for c in reported.values() for rows in c.values() for lab, v in rows.items()
+                 if re.match(r"^(Sales|Revenue)", lab)] or [0])
+    odd = []
+    for m in NUM.finditer(text):
+        cr = to_crore(m.group(1), m.group(2))
+        if not VALID.match(m.group(1).rstrip(".")) or (scale and cr and cr > 50 * scale):
+            odd.append(f'"{m.group(0).strip()}" {stamp(text, m.start())}')
+    if odd:
+        lines.append(f"Possibly misheard figures (odd format or far out of scale), check against the "
+                     f"results release: {'; '.join(odd[:20])}")
+    summary = ", ".join(f"{v} {k}" for k, v in tally.items()) + f", {len(odd)} odd figure(s)"
+    return "\n".join(lines) + "\n\n", f"number check this quarter: {summary}"
 
 
 # ---------------- run one shard ----------------
