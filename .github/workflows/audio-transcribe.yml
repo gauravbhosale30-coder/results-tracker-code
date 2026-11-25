@@ -1,0 +1,121 @@
+name: Audio transcripts (no PDF)
+# For companies with no usable PDF transcript: download the call recording (Screener "REC"
+# link or an audio link in extra_sources.csv), transcribe it with Whisper on GitHub's free
+# machines, run the quarter check and the number check, and save it to the reading queue.
+# Runs after every Q2 refresh, or by hand. Up to 20 machines work in parallel.
+on:
+  workflow_run:
+    workflows: ["Q2 refresh (list + fetch)"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      codes:
+        description: "Only these company codes, comma-separated (blank = every company that needs audio)"
+        default: ""
+      test_url:
+        description: "Test only: transcribe this one recording; nothing is saved to the data repo"
+        default: ""
+      test_code:
+        description: "Test only: company code for the number check"
+        default: ""
+      test_col:
+        description: "Test only: Screener results column for the number check, e.g. Jun 2026"
+        default: ""
+env:
+  QUARTER: Q2FY27
+  CODES: ${{ inputs.codes }}
+  TEST_URL: ${{ inputs.test_url }}
+  TEST_CODE: ${{ inputs.test_code }}
+  TEST_COL: ${{ inputs.test_col }}
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      count: ${{ steps.plan.outputs.count }}
+      shards: ${{ steps.plan.outputs.shards }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: gauravbhosale30-coder/results-tracker-data
+          token: ${{ secrets.DATA_REPO_TOKEN }}
+          path: data
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -q requests
+      - id: plan
+        run: python transcribe_audio.py plan
+
+  transcribe:
+    needs: plan
+    if: needs.plan.outputs.count != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 345
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: gauravbhosale30-coder/results-tracker-data
+          token: ${{ secrets.DATA_REPO_TOKEN }}
+          path: data
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - run: pip install -q faster-whisper requests beautifulsoup4 yt-dlp
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: whisper-distil-large-v3
+      - name: Transcribe
+        run: python transcribe_audio.py run
+        env:
+          CODES: ${{ inputs.test_url == '' && matrix.codes || inputs.test_code }}
+          SHARD: ${{ matrix.shard }}
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: audio-${{ matrix.shard }}
+          path: out/
+          retention-days: 3
+          if-no-files-found: ignore
+
+  collect:
+    needs: [plan, transcribe]
+    if: always() && needs.plan.outputs.count != '0' && inputs.test_url == ''
+    runs-on: ubuntu-latest
+    concurrency: data-repo-write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: gauravbhosale30-coder/results-tracker-data
+          token: ${{ secrets.DATA_REPO_TOKEN }}
+          path: data
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq poppler-utils && pip install -q requests
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: audio-*
+          path: out
+          merge-multiple: true
+      - name: Add transcripts to the reading queue
+        run: python transcribe_audio.py collect
+      - name: Refresh the queue log (adds the Q1 baseline to each audio file)
+        run: python fetch_queue.py
+      - name: Save to the private data repo
+        run: |
+          cd data
+          git config user.name "tracker-bot"
+          git config user.email "tracker-bot@users.noreply.github.com"
+          git add queue/Q2FY27
+          git commit -m "Q2 FY27 audio transcripts" || echo "No changes"
+          git pull --rebase
+          git push

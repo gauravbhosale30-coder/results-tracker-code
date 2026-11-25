@@ -14,7 +14,10 @@ Writes data/queue/<QUARTER>/<CODE>.txt  one text file per company
        data/queue/<QUARTER>/_rejected/    calls that failed the quarter check, kept for review
 
 Sources: Screener (manifest) + hand-found links, then joint call. Every source passes the
-same quarter check. (BSE filings were tried and dropped: BSE refuses GitHub's servers.)
+same quarter check (qcheck.py). Audio/video links (Screener "REC", or audio links in
+extra_sources.csv) are left to transcribe_audio.py, which only runs where no PDF was saved.
+An audio-transcribed file is replaced by a PDF transcript that arrives later, unless that
+company's record for the quarter is already written. (BSE filings were tried and dropped: BSE refuses GitHub's servers.)
 
 Resumable: saved files are skipped, so it can be rerun as late transcripts are filed.
 Files with a non-web Source (manual uploads) are never replaced; only the
@@ -24,42 +27,14 @@ import csv, glob, os, re, subprocess, tempfile, time
 
 import requests
 
+from qcheck import CONFIGS, is_audio, score as qscore
+
 LIST = "data/value_chain_leaders.csv"
 MANIFEST = "data/manifest.csv"
 QUARTER = os.environ.get("QUARTER") or "Q2FY27"
 LIMIT = int(os.environ.get("LIMIT") or 0)
 MIN_CHARS = 3000                     # less = scanned image PDF or broken file
 
-# A real Q2 call names Q2/H1 FY27 more often than Q1 FY27. Q1 calls also say "Q2 FY27"
-# (guidance), so a single mention is not enough: tested on the 468 Q1 transcripts,
-# "any mention" wrongly passed 83 of them, "Q2 mentions > Q1 mentions" passed 1.
-Q2_RE = re.compile(r"Q2\s*-?\s*(FY|F\.Y\.)\s*'?(20)?27|H1\s*-?\s*(FY|F\.Y\.)\s*'?(20)?27|"
-                   r"(second|2nd) quarter (and (the )?(first )?half[- ]year )?(of |for )?(the )?"
-                   r"(fiscal|financial year|FY)\s*'?(20)?(27|2026-27)|"
-                   r"(quarter|half[- ]?year|six months) (and (half[- ]year|six months) )?ended (on )?"
-                   r"(30(th)? sep(tember|t)?\.?,? 2026|sep(tember|t)?\.? 30(th)?,? 2026)|"
-                   r"[QH]2 (of )?(FY ?)?2026-27|Q2\s*(FY)?\s*2027|Q2'27", re.I)
-Q1_RE = re.compile(r"Q1\s*-?\s*(FY|F\.Y\.)\s*'?(20)?27|(first|1st) quarter (of |for )?(the )?"
-                   r"(fiscal|financial year|FY)\s*'?(20)?(27|2026-27)|"
-                   r"quarter ended (on )?(30(th)? june,? 2026|june 30(th)?,? 2026)|"
-                   r"Q1 (of )?(FY ?)?2026-27|Q1\s*(FY)?\s*2027|Q1'27", re.I)
-
-# Calendar-year reporters (Castrol, Varun Beverages...): the Sep quarter is their Q3 / nine months.
-CY_RE = re.compile(r"Q3\s*(CY|C\.Y\.)?\s*'?(20)?26\b|Q3 (of )?(CY|calendar year )?(20)?26|"
-                   r"third quarter (of )?(20|CY ?|calendar year ?)?26|"
-                   r"(nine|9) months ended (on )?(30(th)? sep|sep(tember|t)?\.? 30)", re.I)
-# Weak fallback when a call never writes "FY27": bare Q2/H1 words must outnumber bare Q1 words.
-# Tested on the 468 Q1 transcripts it wrongly passes 14 (3%), so files saved this way are flagged.
-WEAK_THIS = re.compile(r"\b(Q2|H1|second quarter|first half|september quarter|sept?(ember)?[- ]quarter)\b", re.I)
-WEAK_PREV = re.compile(r"\b(Q1|first quarter|june quarter)\b", re.I)
-
-CONFIGS = {
-    # Every Oct-Dec call must pass the Q2 check (Oct-Nov also hold investor meets).
-    # "Not read" = the 11 names with no Q1 call: try again for a first baseline.
-    "Q2FY27": dict(window=("2026-10", "2026-12"), this=(Q2_RE, CY_RE), prev=Q1_RE,
-                   weak_this=WEAK_THIS, weak_prev=WEAK_PREV,
-                   waves=("Wave 1", "Wave 2", "Not read")),
-}
 if QUARTER not in CONFIGS:
     raise SystemExit(f"No config for {QUARTER}; the Q1FY27 queue is final.")
 CONFIG = CONFIGS[QUARTER]
@@ -70,7 +45,9 @@ BASELINE_MARK = "=== Q1 FY27 BASELINE"
 TRANSCRIPT_MARK = f"=== {QUARTER[:2]} FY27 TRANSCRIPT ==="
 BASELINE_SECTIONS = ("Verdict", "Promises to track", "Scores")
 
-GOOD = {"saved", "saved_weak_match", "saved_joint", "already_done", "manual_kept", "annual_only"}
+GOOD = {"saved", "saved_weak_match", "saved_joint", "already_done", "manual_kept", "annual_only",
+        "saved_audio"}
+AUDIO_MARK = "Source type: audio"            # header line written by transcribe_audio.py
 
 OUT = f"data/queue/{QUARTER}"
 os.makedirs(OUT, exist_ok=True)
@@ -101,15 +78,7 @@ def pdf_text(url):
 
 
 def score(text):
-    """(strength, score): 2 = names the quarter (FY27 or calendar-year wording) more than Q1 FY27;
-    1 = never names it but bare Q2/H1 words outnumber bare Q1 words (weak: flagged); 0 = reject."""
-    head = text[:20000]
-    hits = sum(len(r.findall(head)) for r in CONFIG["this"])
-    if hits:
-        sc = hits - len(CONFIG["prev"].findall(head))
-        return (2, sc) if sc > 0 else (0, sc)
-    a, b = len(CONFIG["weak_this"].findall(text)), len(CONFIG["weak_prev"].findall(text))
-    return (1, a - b) if a >= 3 and a > b else (0, a - b)
+    return qscore(text, CONFIG)
 
 
 def source_of(path):
@@ -161,20 +130,41 @@ def add_baseline_to_manual(path, code):
         f.write(head + "\n\n" + baseline(code) + TRANSCRIPT_MARK + "\n\n" + body)
 
 
+def is_audio_file(path):
+    return AUDIO_MARK in open(path, encoding="utf-8").read(3000)
+
+
+# Companies whose record for this quarter is already written: their audio file is never replaced
+written = {os.path.basename(p)[:-3] for p in glob.glob(f"data/records/{QUARTER}/**/*.md", recursive=True)}
+
+# Results of the last audio run (transcribe_audio.py): why a recording could not be used
+audio_log = {}
+if os.path.exists(f"{OUT}/_audio_log.csv"):
+    audio_log = {r["code"]: r for r in csv.DictReader(open(f"{OUT}/_audio_log.csv", encoding="utf-8"))
+                 if r["status"] != "saved_audio"}
+
 # ---------- candidate calls per company ----------
 used_q1 = {source_of(p) for p in glob.glob("data/queue/Q1FY27/*.txt")}
 
-cands = {}
+cands, audio_links = {}, {}
 for row in csv.DictReader(open(MANIFEST, encoding="utf-8")):
     w = CONFIG["window"]
-    if w[0] <= row["period"] <= w[1] and row["url"] and row["url"] not in used_q1:
+    if not (w[0] <= row["period"] <= w[1] and row["url"]):
+        continue
+    if row["status"] == "audio" or is_audio(row["url"]):   # recordings go to transcribe_audio.py
+        audio_links.setdefault(row["code"], []).append(row["url"])
+    elif row["url"] not in used_q1:
         cands.setdefault(row["code"], []).append(row)
 # Screener shows "Transcript" without a link: the call happened, transcript not attached yet
 pending = {r["code"] for r in csv.DictReader(open(MANIFEST, encoding="utf-8"))
-           if CONFIG["window"][0] <= r["period"] <= CONFIG["window"][1] and not r["url"]}
+           if CONFIG["window"][0] <= r["period"] <= CONFIG["window"][1] and not r["url"]
+           and r["status"] != "audio"}
 if os.path.exists("data/extra_sources.csv"):              # hand-found links
     for r in csv.DictReader(open("data/extra_sources.csv", encoding="utf-8")):
         if r.get("quarter", QUARTER) == QUARTER and r.get("url", "").startswith("http"):
+            if is_audio(r["url"]):
+                audio_links.setdefault(r["code"].strip(), []).append(r["url"].strip())
+                continue
             cands.setdefault(r["code"].strip(), []).append(
                 {"code": r["code"].strip(), "period": "manual-link", "url": r["url"].strip()})
 
@@ -227,12 +217,19 @@ for n, c in enumerate(companies, 1):
         status = "manual_kept"                        # user-supplied: never replaced
         source = source_of(path) or "manual"
         add_baseline_to_manual(path, code)
-    elif os.path.exists(path):
+    elif os.path.exists(path) and not is_audio_file(path):
         status, source = "already_done", source_of(path)
+    elif os.path.exists(path) and (safe(code) in written or code in written or not cands.get(code)):
+        status, source = "saved_audio", source_of(path)   # audio kept: record written or no PDF yet
+        add_baseline_to_manual(path, code)
     elif code in ANNUAL_ONLY:
         status = "annual_only"
     else:
+        audio_path = path if os.path.exists(path) else None
         row, text, status, source = pick(code)
+        if row is None and audio_path:                    # no usable PDF yet: keep the audio version
+            status, source = "saved_audio", source_of(audio_path)
+            add_baseline_to_manual(audio_path, code)
         note = ""
         if row is None and code in JOINT_CALL:
             partner = JOINT_CALL[code]
@@ -243,9 +240,15 @@ for n, c in enumerate(companies, 1):
                 status, note = "saved_joint", f"Joint call with {partner}"
         if status == "saved_weak_match":
             note = "Weak quarter match: confirm the call date before reading"
-        if row is None:
+        if row is None and status != "saved_audio":
             evidence, source = (f"Screener links: {source}" if source else ""), ""
+            if audio_links.get(code):
+                evidence = (evidence + " | Audio: " + " ".join(audio_links[code])).strip(" |")
+            if code in audio_log:
+                evidence = (evidence + f" | Audio {audio_log[code]['status']}: {audio_log[code]['note']}").strip(" |")
         if row is not None:
+            if audio_path:
+                note = (note + "; " if note else "") + "PDF transcript replaced the earlier audio transcription"
             picked[code] = (row, text)
             call_month, source = row["period"], row["url"]
             with open(path, "w", encoding="utf-8") as f:
@@ -264,7 +267,7 @@ with open(os.path.join(OUT, "_log.csv"), "w", newline="", encoding="utf-8") as f
     w.writeheader()
     w.writerows(log)
 # What needs a hand-found link: call clearly held first, then announced, then the rest
-order = {"call_done_transcript_pending": 0, "download_failed": 1, "no_text": 2, "not_quarter_call": 3}
+order = {"call_done_transcript_pending": 0, "audio_failed": 0, "download_failed": 1, "no_text": 2, "not_quarter_call": 3}
 missing = sorted([l for l in log if l["status"] not in GOOD],
                  key=lambda l: (order.get(l["status"], 2), l["chain"], l["wave"]))
 with open(os.path.join(OUT, "_missing.csv"), "w", newline="", encoding="utf-8") as f:

@@ -11,6 +11,7 @@ Fixes from the counting run:
 - finds the date by walking up from the Transcript link, not only from its <li>
 - records transcripts whose link has no URL, instead of silently skipping them
 - retries on rate limits
+- also lists call recordings ("REC" links) as status = audio
 """
 import csv, os, re, time
 from datetime import date
@@ -99,10 +100,12 @@ for i, row in enumerate(rows, 1):
         # Any tag whose own text is "Transcript": linked (<a>) or not yet linked (<div>/<span>,
         # shown greyed by Screener when the call is held but the PDF is not attached).
         # Innermost match only, so <a><span>Transcript</span></a> is counted once.
+        # "REC" = the call recording (audio/video): kept as status "audio" for transcribe_audio.py.
         for el in soup.find_all(True):
-            if el.get_text(strip=True).lower() != "transcript":
+            label = el.get_text(strip=True).lower()
+            if label not in ("transcript", "rec"):
                 continue
-            if any(ch.get_text(strip=True).lower() == "transcript" for ch in el.find_all(True)):
+            if any(ch.get_text(strip=True).lower() == label for ch in el.find_all(True)):
                 continue
             m = find_date(el)
             if not m:
@@ -114,10 +117,16 @@ for i, row in enumerate(rows, 1):
             url = link_of(el, r.url)
             if not url and el.find_parent("a") is not None:
                 url = link_of(el.find_parent("a"), r.url)
+            if label == "rec" and not url:
+                continue
             key = (code, period, url)
             if key in seen:
                 continue
             seen.add(key)
+            if label == "rec":
+                out.append({"code": code, "name": row["Name"], "industry": row.get("Industry", ""),
+                            "period": period, "url": url, "status": "audio"})
+                continue
             found += 1
             out.append({"code": code, "name": row["Name"],
                         "industry": row.get("Industry", ""),
@@ -143,4 +152,5 @@ with open(MANIFEST, "w", newline="", encoding="utf-8") as f:
 
 print("Transcripts listed:", len(out))
 print("Without a link:", sum(1 for o in out if o["status"] == "no_link"))
+print("Recordings (REC):", sum(1 for o in out if o["status"] == "audio"))
 print("Companies with transcripts:", len({o["code"] for o in out}))
