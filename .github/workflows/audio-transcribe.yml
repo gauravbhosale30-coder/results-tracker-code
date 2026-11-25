@@ -122,6 +122,16 @@ jobs:
           git config user.email "tracker-bot@users.noreply.github.com"
           git add queue/Q2FY27
           git commit -m "Q2 FY27 audio transcripts" || echo "No changes"
-          # no concurrency lock (a queued lock cancels older waiting runs and loses their transcripts):
-          # retry the push if another run wrote to the data repo meanwhile
-          for i in 1 2 3 4 5; do git pull --rebase && git push && break; sleep $((i*20)); done
+          # no concurrency lock (a queued lock cancels older waiting runs and loses their transcripts).
+          # If another run wrote to the data repo meanwhile, start again from its latest state:
+          # re-add this run's transcripts and rebuild the logs, then push. Fail loudly if it never works.
+          for i in 1 2 3 4 5; do
+            if git pull --rebase && git push; then exit 0; fi
+            git rebase --abort 2>/dev/null || true
+            git fetch -q origin && git reset -q --hard origin/main
+            (cd .. && python transcribe_audio.py collect && python fetch_queue.py)
+            git add queue/Q2FY27
+            git commit -m "Q2 FY27 audio transcripts" || echo "No changes"
+            sleep $((i*20))
+          done
+          exit 1
