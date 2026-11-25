@@ -289,8 +289,9 @@ def number_check(code, text, col):
             continue
         lines.append(f"{label.capitalize()} ({c}):")
         for name, row_re, kw in METRICS:
-            values = {k: v for k, rows in reported[c].items() for lab, v in rows.items() if row_re.match(lab)}
-            if not values or all(abs(v) < 1 for v in values.values()):
+            values = {k: v for k, rows in reported[c].items() for lab, v in rows.items()
+                      if row_re.match(lab) and abs(v) >= 1}          # zero rows (e.g. REITs) cannot be checked
+            if not values:
                 continue
             near = []
             for m in kw.finditer(text):
@@ -394,7 +395,11 @@ def run():
                     f.write(f"Code: {code}\nSource: {url}\n\n{text}")
                 continue
             col = os.environ.get("TEST_COL") or CONFIG["results_col"]
-            checks, summary = number_check(code, text, col)
+            try:
+                checks, summary = number_check(code, text, col)
+            except Exception as e:                        # never lose a finished transcript
+                checks = f"=== NUMBER CHECK ===\nNumber check failed ({type(e).__name__}): check figures by hand.\n\n"
+                summary = "number check failed: check figures by hand"
             note = f"Audio transcription ({mins:.0f} min); {summary}"
             if strength == 1:
                 note += "; weak quarter match: confirm the call date before reading"
