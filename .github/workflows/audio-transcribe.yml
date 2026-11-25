@@ -74,7 +74,7 @@ jobs:
         with:
           python-version: '3.12'
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
-      - run: pip install -q faster-whisper requests beautifulsoup4 yt-dlp
+      - run: pip install -q faster-whisper requests beautifulsoup4 yt-dlp aia certifi
       - uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface

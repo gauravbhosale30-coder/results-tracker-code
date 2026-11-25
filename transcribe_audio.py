@@ -108,10 +108,34 @@ def plan():
 
 
 # ---------------- download + transcribe ----------------
+def ca_bundle_for(url):
+    """Some company sites send an incomplete certificate chain (browsers fetch the missing
+    intermediate themselves, Python does not). Fetch it the same way (AIA) and verify with it."""
+    try:
+        import certifi
+        from aia import AIASession
+        chain = AIASession().cadata_from_url(url)
+    except Exception:
+        return None
+    path = "/tmp/ca_bundle.pem"
+    with open(path, "w") as f:
+        f.write(open(certifi.where()).read() + "\n" + chain)
+    return path
+
+
 def download(url, dest):
     """Direct media file first; web pages (YouTube, webcast players) through yt-dlp."""
+    err = download_once(url, dest, True)
+    if err and "SSL" in err:
+        bundle = ca_bundle_for(url)
+        if bundle:
+            err = download_once(url, dest, bundle)
+    return err
+
+
+def download_once(url, dest, verify):
     try:
-        with s.get(url, stream=True, timeout=60) as r:
+        with s.get(url, stream=True, timeout=60, verify=verify) as r:
             ctype = r.headers.get("content-type", "")
             if r.ok and ("audio" in ctype or "video" in ctype or "octet-stream" in ctype
                          or (is_audio(url) and "html" not in ctype)):
