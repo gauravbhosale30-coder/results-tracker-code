@@ -252,8 +252,8 @@ def number_check(code, text, col):
     pers = periods(col)
     reported = screener_results(code, [c for _, c in pers])
     lines = [f"=== NUMBER CHECK: recording vs reported results (Screener, Rs cr) ===",
-             "MATCHED = a figure said near the item is within 2.5% of the reported one. "
-             "CHECK BY HAND = the nearest figure said is 2.5-35% off (misheard, or a segment / "
+             "MATCHED = a figure said near the item is within 1.5% of the reported one. "
+             "CHECK BY HAND = the nearest figure said is 1.5-35% off (misheard, or a segment / "
              "standalone / adjusted figure). NOT SAID = no figure found for it."]
     found = [(m.start(), to_crore(m.group(1), m.group(2)), m.group(0).strip()) for m in NUM.finditer(text)]
     found = [f for f in found if f[1]]
